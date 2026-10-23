@@ -1,0 +1,1501 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PDF Flipbook with Zoom</title>
+
+    <!--
+        PDF flipbook with animated media overlays.
+
+        Files next to this page:
+          document.pdf   - the pictorial (unchanged, still the source of truth)
+          media.json     - OPTIONAL list of videos/GIFs to lay over the PDF pages
+          media/         - the video/GIF files that media.json points to
+
+        Without media.json the page behaves exactly like the original flipbook.
+
+        To place media, open this page with ?edit at the end of the URL
+        (e.g. http://localhost:8000/?edit), draw rectangles over the static
+        screenshots, then download media.json and commit it next to this file.
+
+        media.json format - positions are fractions (0-1) of the page size:
+          [ { "page": 4, "x": 0.47, "y": 0.15, "w": 0.48, "h": 0.33,
+              "src": "media/ripple.mp4", "fit": "cover" } ]
+        "fit" is optional: "cover" (default, fills the box) or "contain".
+    -->
+
+    <!-- Dependencies via CDN -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/page-flip@0.4.3/dist/js/page-flip.browser.js"></script>
+
+    <style>
+        body {
+            margin: 0;
+            padding: 15px;
+            background-color: #1e293b;
+            color: #ffffff;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+            font-family: system-ui, -apple-system, sans-serif;
+            box-sizing: border-box;
+            overflow-x: hidden;
+        }
+
+        #status {
+            font-size: 1.1rem;
+            margin-bottom: 15px;
+        }
+
+        /* Responsive container to maximize screen usage */
+        .container {
+            width: 95vw;
+            height: 75vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+
+        #book {
+            box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+            display: none; /* Shown after load */
+            cursor: pointer; /* clicking a page flips it */
+        }
+
+        /* One flipbook page: the rendered PDF image with media laid on top */
+        .page {
+            background: #ffffff;
+            overflow: hidden;
+        }
+
+        .page-img {
+            display: block;
+            width: 100%;
+            height: 100%;
+            user-select: none;
+            -webkit-user-drag: none;
+        }
+
+        .media {
+            position: absolute;
+            display: block;
+            pointer-events: none; /* let clicks through so page flipping still works */
+            background: transparent;
+        }
+
+        .cover {
+            position: absolute;
+            overflow: hidden;
+            pointer-events: none; /* clicks pass through to the page / video below */
+        }
+
+        .cover-img {
+            position: absolute;
+            max-width: none;
+            user-select: none;
+        }
+
+        .controls {
+            margin-top: 15px;
+            display: flex;
+            gap: 12px;
+            align-items: center;
+        }
+
+        button {
+            padding: 10px 20px;
+            font-size: 1rem;
+            font-weight: 600;
+            cursor: pointer;
+            border: none;
+            border-radius: 6px;
+            background-color: #3b82f6;
+            color: white;
+            transition: background 0.2s;
+        }
+
+        button:hover { background-color: #2563eb; }
+        button:disabled { background-color: #475569; cursor: not-allowed; }
+        .zoom-btn { background-color: #10b981; }
+        .zoom-btn:hover { background-color: #059669; }
+
+        /* Fullscreen Lightbox Zoom Modal */
+        #zoom-modal {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100vw;
+            height: 100vh;
+            background: rgba(0, 0, 0, 0.9);
+            z-index: 9999;
+            justify-content: center;
+            align-items: center;
+            cursor: zoom-out;
+            overflow: auto;
+        }
+
+        #zoom-stage {
+            position: relative;
+            border-radius: 4px;
+            overflow: hidden;
+            box-shadow: 0 0 20px rgba(0,0,0,0.8);
+        }
+
+        #zoom-stage .page-img { width: 100%; height: 100%; }
+
+        /* In the zoom view, media can be clicked (controls, unmute, scrub) */
+        #zoom-stage .media { pointer-events: auto; cursor: default; }
+
+        .modal-tip {
+            position: absolute;
+            top: 15px;
+            color: #ccc;
+            font-size: 0.9rem;
+            pointer-events: none;
+        }
+
+        /* ---------- Placement editor (?edit) ---------- */
+        #editor {
+            display: none;
+            width: 100%;
+            max-width: 1600px;
+            gap: 16px;
+            align-items: flex-start;
+        }
+
+        #editor.active { display: flex; }
+
+        .ed-main { flex: 1; min-width: 0; }
+
+        .ed-bar {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+            margin-bottom: 10px;
+            flex-wrap: wrap;
+        }
+
+        .ed-bar button { padding: 6px 14px; font-size: 0.9rem; }
+
+        .ed-hint { color: #94a3b8; font-size: 0.85rem; }
+
+        #ed-stage {
+            position: relative;
+            width: 100%;
+            cursor: crosshair;
+            touch-action: none;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+            background: #fff;
+        }
+
+        #ed-stage .page-img { height: auto; }
+
+        .region {
+            position: absolute;
+            box-sizing: border-box;
+            border: 2px dashed #f59e0b;
+            background: rgba(245, 158, 11, 0.12);
+            cursor: move;
+        }
+
+        .region.selected {
+            border-style: solid;
+            border-color: #22d3ee;
+            background: rgba(34, 211, 238, 0.12);
+        }
+
+        .region .media { width: 100%; height: 100%; left: 0; top: 0; opacity: 0.85; }
+
+        .region-label {
+            position: absolute;
+            left: 0;
+            top: 0;
+            max-width: 100%;
+            padding: 2px 6px;
+            font-size: 12px;
+            background: rgba(15, 23, 42, 0.85);
+            color: #fff;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            pointer-events: none;
+        }
+
+        .region-handle {
+            position: absolute;
+            right: -7px;
+            bottom: -7px;
+            width: 14px;
+            height: 14px;
+            background: #22d3ee;
+            border: 2px solid #0f172a;
+            border-radius: 3px;
+            cursor: nwse-resize;
+        }
+
+        .region:not(.selected) .region-handle { display: none; }
+
+        .ed-side {
+            width: 340px;
+            flex-shrink: 0;
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }
+
+        .ed-card {
+            background: #0f172a;
+            border-radius: 8px;
+            padding: 12px;
+        }
+
+        .ed-card h3 { margin: 0 0 8px; font-size: 0.95rem; }
+
+        .ed-item {
+            border: 1px solid #334155;
+            border-radius: 6px;
+            padding: 8px;
+            margin-bottom: 8px;
+            font-size: 0.85rem;
+        }
+
+        .ed-item.selected { border-color: #22d3ee; }
+
+        .ed-item label { display: block; color: #94a3b8; margin: 4px 0 2px; }
+
+        .ed-item input[type="text"], .ed-item select {
+            width: 100%;
+            box-sizing: border-box;
+            padding: 5px 6px;
+            background: #1e293b;
+            color: #fff;
+            border: 1px solid #334155;
+            border-radius: 4px;
+            font: inherit;
+        }
+
+        .ed-row { display: flex; gap: 6px; margin-top: 6px; flex-wrap: wrap; }
+
+        #ed-report { font-size: 0.8rem; margin-top: 8px; }
+        #ed-report ul { margin: 4px 0 0; padding-left: 18px; }
+        #ed-report li { margin-bottom: 3px; }
+        #ed-report .ok { color: #6ee7b7; }
+        #ed-report .warn { color: #fcd34d; }
+
+        .cover-opts { margin-top: 10px; border-top: 1px solid #334155; padding-top: 8px; }
+        .cover-opt { display: flex; gap: 8px; align-items: flex-start; margin-top: 8px; cursor: pointer; }
+        .cover-opt input { margin-top: 3px; flex-shrink: 0; }
+        .cover-where { color: #94a3b8; }
+
+        .region.redraw { border-color: #c084fc; background: transparent; }
+        .region.redraw.selected { border-color: #e879f9; }
+        .region .cover { pointer-events: none; }
+        .cover-tint { position: absolute; inset: 0; background: rgba(192, 132, 252, 0.45); }
+        .ed-row button { padding: 5px 10px; font-size: 0.8rem; }
+        .ed-danger { background-color: #dc2626; }
+        .ed-danger:hover { background-color: #b91c1c; }
+
+        #ed-json {
+            width: 100%;
+            box-sizing: border-box;
+            height: 220px;
+            background: #1e293b;
+            color: #e2e8f0;
+            border: 1px solid #334155;
+            border-radius: 4px;
+            font: 12px ui-monospace, monospace;
+        }
+
+        @media (max-width: 900px) {
+            #editor.active { flex-direction: column; }
+            .ed-side { width: 100%; }
+        }
+    </style>
+</head>
+<body>
+
+    <div id="status">Loading document.pdf...</div>
+
+    <div class="container" id="viewer">
+        <div id="book"></div>
+    </div>
+
+    <div class="controls" id="viewer-controls">
+        <button id="prev-btn" disabled>◀ Prev</button>
+        <button id="zoom-btn" class="zoom-btn" disabled>🔍 Zoom Page</button>
+        <button id="next-btn" disabled>Next ▶</button>
+    </div>
+
+    <!-- Zoom Modal -->
+    <div id="zoom-modal">
+        <span class="modal-tip">Click outside the page or press Esc to exit zoom</span>
+        <div id="zoom-stage"></div>
+    </div>
+
+    <!-- Placement editor, only shown with ?edit -->
+    <div id="editor">
+        <div class="ed-main">
+            <div class="ed-bar">
+                <button id="ed-prev">◀</button>
+                <span id="ed-page-label">Page 1</span>
+                <button id="ed-next">▶</button>
+                <span class="ed-hint">Drag on the page to draw a media box. Drag a box to move it, its corner to resize, Delete to remove.</span>
+            </div>
+            <div id="ed-stage"></div>
+        </div>
+        <div class="ed-side">
+            <div class="ed-card">
+                <h3>Import from PowerPoint</h3>
+                <div class="ed-hint">Pick the .pptx your PDF was exported from. Its videos and animated GIFs are placed automatically.</div>
+                <div class="ed-row">
+                    <button id="ed-import">Import .pptx…</button>
+                    <button id="ed-zip" hidden>Download media files (.zip)</button>
+                </div>
+                <input type="file" id="ed-import-file" accept=".pptx,application/vnd.openxmlformats-officedocument.presentationml.presentation" hidden>
+                <div id="ed-report"></div>
+            </div>
+            <div class="ed-card">
+                <h3>Media on this page</h3>
+                <div id="ed-list"></div>
+            </div>
+            <div class="ed-card">
+                <h3>media.json</h3>
+                <textarea id="ed-json" spellcheck="false" readonly></textarea>
+                <div class="ed-row">
+                    <button id="ed-download">Download media.json</button>
+                    <button id="ed-copy">Copy</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.worker.min.js';
+
+        const PDF_FILE = 'document.pdf';
+        const MEDIA_FILE = 'media.json';
+        const MEDIA_FOLDER = 'media/';
+        const EDIT_MODE = new URLSearchParams(location.search).has('edit');
+        const REDUCED_MOTION = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+        const VIDEO_EXT = /\.(mp4|webm|ogv|ogg|mov|m4v)(\?.*)?$/i;
+
+        // ---------- Shared helpers ----------
+
+        // Load media.json. A missing file just means "no overlays".
+        async function loadMediaList() {
+            try {
+                const res = await fetch(MEDIA_FILE, { cache: 'no-cache' });
+                if (!res.ok) return [];
+                const data = await res.json();
+                if (!Array.isArray(data)) throw new Error('media.json must be a list');
+                return data.filter(m =>
+                    Number.isInteger(m.page) &&
+                    [m.x, m.y, m.w, m.h].every(v => typeof v === 'number') &&
+                    (typeof m.src === 'string' || m.redraw === true));
+            } catch (err) {
+                console.warn('Could not read ' + MEDIA_FILE + ':', err);
+                return [];
+            }
+        }
+
+        // Build a <video> or <img> for one media entry, positioned as % of the page.
+        // `src` can be overridden (the editor uses this for local previews).
+        function makeMediaEl(entry, { inZoom = false, src = entry.src } = {}) {
+            let el;
+            if (VIDEO_EXT.test(entry.src)) {
+                el = document.createElement('video');
+                // Set as attributes, not just properties: the flipbook clones
+                // pages that are lying still, and clones only keep attributes.
+                el.setAttribute('muted', '');
+                el.setAttribute('loop', '');
+                el.setAttribute('playsinline', '');
+                el.setAttribute('preload', 'auto');
+                if (!REDUCED_MOTION) el.setAttribute('autoplay', '');
+                if (inZoom) el.setAttribute('controls', '');
+                el.muted = true;
+            } else {
+                el = document.createElement('img');
+                el.alt = '';
+                el.draggable = false;
+            }
+            el.className = 'media';
+            el.src = src;
+            el.style.left = (entry.x * 100) + '%';
+            el.style.top = (entry.y * 100) + '%';
+            el.style.width = (entry.w * 100) + '%';
+            el.style.height = (entry.h * 100) + '%';
+            el.style.objectFit = entry.fit === 'contain' ? 'contain' : 'cover';
+            return el;
+        }
+
+        // A "redraw" entry copies a piece of the PDF page back on top of the clips,
+        // so labels that sat above a video in the document stay visible.
+        // The piece is the page image itself, cropped to the box and cut to the
+        // label's shape with a CSS clip-path (e.g. rounded corners).
+        function makeCoverEl(entry, pageSrc) {
+            const div = document.createElement('div');
+            div.className = 'cover';
+            div.style.left = (entry.x * 100) + '%';
+            div.style.top = (entry.y * 100) + '%';
+            div.style.width = (entry.w * 100) + '%';
+            div.style.height = (entry.h * 100) + '%';
+            if (entry.clip) {
+                div.style.clipPath = entry.clip;
+                div.style.setProperty('-webkit-clip-path', entry.clip);
+            }
+            const img = document.createElement('img');
+            img.className = 'cover-img';
+            img.src = pageSrc;
+            img.alt = '';
+            img.draggable = false;
+            // Scale the page so the box shows exactly the part of the page under it.
+            img.style.width = (100 / entry.w) + '%';
+            img.style.height = (100 / entry.h) + '%';
+            img.style.left = (-entry.x / entry.w * 100) + '%';
+            img.style.top = (-entry.y / entry.h * 100) + '%';
+            div.appendChild(img);
+            return div;
+        }
+
+        // Add a page's clips, then its redrawn areas (which must be on top).
+        function addPageLayers(container, entries, pageSrc, { inZoom = false } = {}) {
+            for (const m of entries.filter(m => !m.redraw)) {
+                const el = makeMediaEl(m, { inZoom });
+                if (inZoom) el.addEventListener('click', e => e.stopPropagation());
+                container.appendChild(el);
+            }
+            for (const m of entries.filter(m => m.redraw)) container.appendChild(makeCoverEl(m, pageSrc));
+        }
+
+        function makePageImg(src) {
+            const img = document.createElement('img');
+            img.className = 'page-img';
+            img.src = src;
+            img.alt = '';
+            img.draggable = false;
+            return img;
+        }
+
+        // Render every PDF page to a JPEG (same 3x quality as the original page).
+        async function renderPdf(statusEl) {
+            const pdf = await pdfjsLib.getDocument(PDF_FILE).promise;
+            const images = [];
+            for (let i = 1; i <= pdf.numPages; i++) {
+                statusEl.textContent = `Rendering page ${i} of ${pdf.numPages}...`;
+                const page = await pdf.getPage(i);
+                const viewport = page.getViewport({ scale: 3.0 });
+                const canvas = document.createElement('canvas');
+                canvas.width = viewport.width;
+                canvas.height = viewport.height;
+                await page.render({ canvasContext: canvas.getContext('2d'), viewport }).promise;
+                // Blob URLs use far less memory than data URLs for big images.
+                const blob = await new Promise(r => canvas.toBlob(r, 'image/jpeg', 0.92));
+                images.push(URL.createObjectURL(blob));
+                canvas.width = canvas.height = 0;
+            }
+            const first = (await pdf.getPage(1)).getViewport({ scale: 1.0 });
+            return { images, aspect: first.width / first.height };
+        }
+
+        // ---------- Flipbook viewer ----------
+
+        function startViewer(images, aspect, mediaList) {
+            const bookEl = document.getElementById('book');
+            const prevBtn = document.getElementById('prev-btn');
+            const nextBtn = document.getElementById('next-btn');
+            const zoomBtn = document.getElementById('zoom-btn');
+            const zoomModal = document.getElementById('zoom-modal');
+            const zoomStage = document.getElementById('zoom-stage');
+
+            const mediaForPage = i => mediaList.filter(m => m.page === i + 1);
+
+            // Each page is an HTML element so videos can sit on top of the image.
+            const pageEls = images.map((src, i) => {
+                const div = document.createElement('div');
+                div.className = 'page';
+                div.dataset.index = i;
+                div.appendChild(makePageImg(src));
+                addPageLayers(div, mediaForPage(i), src);
+                return div;
+            });
+
+            bookEl.style.display = 'block';
+
+            const targetHeight = 650;
+            const targetWidth = targetHeight * aspect;
+
+            const pageFlip = new St.PageFlip(bookEl, {
+                width: targetWidth,
+                height: targetHeight,
+                size: "stretch",
+                minWidth: 280,
+                maxWidth: 1200,
+                minHeight: 400,
+                maxHeight: 1400,
+                showCover: true
+            });
+
+            pageFlip.loadFromHTML(pageEls);
+
+            // Only play videos that are actually on screen; pause the rest.
+            const updatePlayback = () => {
+                if (REDUCED_MOTION) return;
+                for (const v of bookEl.querySelectorAll('video')) {
+                    // offsetParent is null when the video or any parent is display:none
+                    const visible = v.offsetParent !== null;
+                    if (visible) {
+                        if (v.paused) v.play().catch(() => {});
+                    } else if (!v.paused) {
+                        v.pause();
+                    }
+                }
+            };
+            const schedulePlayback = () => requestAnimationFrame(() => requestAnimationFrame(updatePlayback));
+            pageFlip.on('flip', schedulePlayback);
+            pageFlip.on('changeState', schedulePlayback);
+            pageFlip.on('changeOrientation', schedulePlayback);
+            window.addEventListener('resize', schedulePlayback);
+            schedulePlayback();
+
+            prevBtn.disabled = false;
+            nextBtn.disabled = false;
+            zoomBtn.disabled = false;
+
+            prevBtn.addEventListener('click', () => pageFlip.flipPrev());
+            nextBtn.addEventListener('click', () => pageFlip.flipNext());
+
+            // Which pages are on screen right now (one page, or both halves of a spread).
+            const visiblePageIndexes = () => {
+                const shown = [...bookEl.querySelectorAll('[data-index]')]
+                    .filter(el => el.offsetParent !== null)
+                    .map(el => Number(el.dataset.index));
+                const unique = [...new Set(shown)].sort((a, b) => a - b);
+                return unique.length ? unique : [pageFlip.getCurrentPageIndex()];
+            };
+
+            // Zoom: the visible page(s) plus their media, with video controls enabled.
+            const openZoom = () => {
+                const indexes = visiblePageIndexes();
+                zoomStage.innerHTML = '';
+                indexes.forEach((pageIndex, n) => {
+                    const half = document.createElement('div');
+                    half.style.cssText = `position:absolute; top:0; height:100%;
+                        width:${100 / indexes.length}%; left:${n * 100 / indexes.length}%;`;
+                    half.appendChild(makePageImg(images[pageIndex]));
+                    addPageLayers(half, mediaForPage(pageIndex), images[pageIndex], { inZoom: true });
+                    zoomStage.appendChild(half);
+                });
+                const ratio = aspect * indexes.length;
+                const w = Math.min(window.innerWidth * 0.95, window.innerHeight * 0.9 * ratio);
+                zoomStage.style.width = w + 'px';
+                zoomStage.style.height = (w / ratio) + 'px';
+                zoomModal.style.display = 'flex';
+                for (const v of bookEl.querySelectorAll('video')) v.pause();
+            };
+
+            const closeZoom = () => {
+                if (zoomModal.style.display !== 'flex') return;
+                zoomModal.style.display = 'none';
+                zoomStage.innerHTML = '';
+                schedulePlayback();
+            };
+
+            // (The original double-click-to-zoom is gone: every click on a page
+            // already flips it, so a double-click flipped twice before zooming.)
+            zoomBtn.addEventListener('click', openZoom);
+
+            zoomModal.addEventListener('click', (e) => {
+                if (e.target === zoomModal || e.target.classList.contains('page-img')) closeZoom();
+            });
+            document.addEventListener('keydown', (e) => {
+                if (e.key === 'Escape') closeZoom();
+            });
+        }
+
+        // ---------- PowerPoint import (used by the editor) ----------
+        //
+        // A .pptx is a zip of XML files. The parts we need:
+        //   ppt/presentation.xml          slide size and slide order
+        //   ppt/slides/slideN.xml         shapes on a slide, with positions
+        //   ppt/slides/_rels/slideN.xml.rels   which media file each shape uses
+        //   ppt/media/*                   the embedded videos and images
+        // Positions are in EMU (914400 per inch); dividing by the slide size
+        // gives the same 0-1 fractions media.json uses.
+
+        const JSZIP_URL = 'https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js';
+        const NS_R = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships';
+
+        function loadScript(src) {
+            return new Promise((resolve, reject) => {
+                const s = document.createElement('script');
+                s.src = src;
+                s.onload = resolve;
+                s.onerror = () => reject(new Error('Could not load ' + src));
+                document.head.appendChild(s);
+            });
+        }
+
+        // Children of an element with a given local name (ignores XML prefixes).
+        const kids = (el, name) => el ? [...el.children].filter(c => c.localName === name) : [];
+        const kid = (el, name) => kids(el, name)[0] || null;
+        // First descendant with a given local name.
+        const find = (el, name) => {
+            if (!el) return null;
+            for (const c of el.getElementsByTagName('*')) if (c.localName === name) return c;
+            return null;
+        };
+
+        // Resolve "../media/media1.mp4" relative to "ppt/slides/slide3.xml".
+        function resolvePath(fromFile, target) {
+            if (target.startsWith('/')) return target.slice(1);
+            const parts = fromFile.split('/').slice(0, -1);
+            for (const seg of target.split('/')) {
+                if (seg === '..') parts.pop();
+                else if (seg !== '.') parts.push(seg);
+            }
+            return parts.join('/');
+        }
+
+        async function readRels(zip, partPath) {
+            const relsPath = partPath.replace(/([^/]+)$/, '_rels/$1.rels');
+            const file = zip.file(relsPath);
+            const map = new Map();
+            if (!file) return map;
+            const doc = new DOMParser().parseFromString(await file.async('string'), 'application/xml');
+            for (const r of doc.getElementsByTagName('Relationship')) {
+                const external = r.getAttribute('TargetMode') === 'External';
+                map.set(r.getAttribute('Id'), {
+                    external,
+                    target: external ? r.getAttribute('Target') : resolvePath(partPath, r.getAttribute('Target'))
+                });
+            }
+            return map;
+        }
+
+        // An animated GIF has more than one "graphic control extension" block.
+        function isAnimatedGif(bytes) {
+            let count = 0;
+            for (let i = 0; i < bytes.length - 2; i++) {
+                if (bytes[i] === 0x21 && bytes[i + 1] === 0xF9 && bytes[i + 2] === 0x04 && ++count > 1) return true;
+            }
+            return false;
+        }
+
+        const MIME = { mp4: 'video/mp4', m4v: 'video/mp4', webm: 'video/webm', mov: 'video/quicktime', gif: 'image/gif' };
+        const WEB_VIDEO = /^(mp4|m4v|webm)$/;
+
+        // ----- Redrawing shapes that sit on top of a clip -----
+        //
+        // The PDF page already contains the label exactly as PowerPoint drew it,
+        // so we copy that part of the page back on top of the video. The only
+        // question is which part: the shape's outline, expressed as a CSS
+        // clip-path. PowerPoint's preset shapes are simple enough to rebuild;
+        // anything else falls back to the bounding rectangle.
+
+        const fmt = v => Math.round(v * 1000) / 1000;
+
+        // Preset shapes we can cut out exactly. Each returns either corner radii
+        // [top-left, top-right, bottom-right, bottom-left] in EMU, an ellipse, or
+        // a polygon in 0-1 fractions of the shape box.
+        // adj values are PowerPoint's yellow-handle settings, in 1/100000ths.
+        const SHAPES = {
+            rect:           ()          => ({ radii: [0, 0, 0, 0] }),
+            roundRect:      (a, m)      => { const r = m * a('adj', 16667); return { radii: [r, r, r, r] }; },
+            round1Rect:     (a, m)      => ({ radii: [0, m * a('adj', 16667), 0, 0] }),
+            round2SameRect: (a, m)      => { const t = m * a('adj1', 16667), b = m * a('adj2', 0); return { radii: [t, t, b, b] }; },
+            round2DiagRect: (a, m)      => { const p = m * a('adj1', 16667), q = m * a('adj2', 0); return { radii: [p, q, p, q] }; },
+            ellipse:        ()          => ({ ellipse: true }),
+            diamond:        ()          => ({ poly: [[.5, 0], [1, .5], [.5, 1], [0, .5]] }),
+            triangle:       (a)         => ({ poly: [[a('adj', 50000), 0], [1, 1], [0, 1]] }),
+            rtTriangle:     ()          => ({ poly: [[0, 0], [1, 1], [0, 1]] }),
+            parallelogram:  (a, m, w)   => { const o = m * a('adj', 25000) / w; return { poly: [[o, 0], [1, 0], [1 - o, 1], [0, 1]] }; },
+            snip1Rect:      (a, m, w, h) => { const s = m * a('adj', 16667); return { poly: [[0, 0], [1 - s / w, 0], [1, s / h], [1, 1], [0, 1]] }; },
+            snip2SameRect:  (a, m, w, h) => {
+                const t = m * a('adj1', 16667), b = m * a('adj2', 0);
+                return { poly: [[t / w, 0], [1 - t / w, 0], [1, t / h], [1, 1 - b / h], [1 - b / w, 1], [b / w, 1], [0, 1 - b / h], [0, t / h]] };
+            },
+            homePlate:      (a, m, w)   => { const o = m * a('adj', 50000) / w; return { poly: [[0, 0], [1 - o, 0], [1, .5], [1 - o, 1], [0, 1]] }; },
+            chevron:        (a, m, w)   => { const o = m * a('adj', 50000) / w; return { poly: [[0, 0], [1 - o, 0], [1, .5], [1 - o, 1], [0, 1], [o, .5]] }; }
+        };
+
+        // Theme line widths for lnRef idx 1-3 (Office default theme), in EMU.
+        const THEME_LINE = [0, 6350, 12700, 19050];
+        const FILLS = ['solidFill', 'gradFill', 'blipFill', 'pattFill', 'grpFill'];
+
+        function describeCover(el, box, slideW, slideH) {
+            const spPr = kid(el, 'spPr');
+            const style = kid(el, 'style');
+            const name = (find(el, 'cNvPr') || { getAttribute: () => '' }).getAttribute('name') || 'a shape';
+            const text = [...el.getElementsByTagName('*')].filter(c => c.localName === 't')
+                .map(t => t.textContent).join(' ').replace(/\s+/g, ' ').trim();
+            const label = text ? `“${text.length > 28 ? text.slice(0, 27) + '…' : text}”` : name;
+
+            // --- Fill: is the shape solid, see-through, or empty? ---
+            let fill = 'none';
+            if (el.localName === 'pic') fill = 'solid';
+            else if (el.localName === 'cxnSp') fill = 'line';
+            else if (el.localName === 'graphicFrame') fill = 'unknown';
+            else {
+                const own = [...(spPr ? spPr.children : [])].find(c => c.localName === 'noFill' || FILLS.includes(c.localName));
+                if (own) {
+                    if (own.localName === 'noFill') fill = 'none';
+                    else {
+                        const alpha = find(own, 'alpha');
+                        fill = alpha && Number(alpha.getAttribute('val')) < 100000 ? 'seeThrough' : 'solid';
+                    }
+                } else {
+                    // No fill of its own: inserted shapes take one from the theme, text boxes don't.
+                    const fillRef = find(style, 'fillRef');
+                    fill = fillRef && fillRef.getAttribute('idx') !== '0' ? 'solid' : 'none';
+                }
+            }
+
+            // --- Outline: its outer half pokes out past the shape box. ---
+            let lineW = 0;
+            const ln = kid(spPr, 'ln');
+            const lnRef = find(style, 'lnRef');
+            const themeW = lnRef ? THEME_LINE[Number(lnRef.getAttribute('idx'))] || 0 : 0;
+            if (ln && !kid(ln, 'noFill')) {
+                const visible = [...ln.children].some(c => FILLS.includes(c.localName)) || themeW;
+                if (visible) lineW = Number(ln.getAttribute('w')) || themeW || 12700;
+            } else if (!ln) {
+                lineW = themeW;
+            }
+            // Arrowheads are wider than the line itself.
+            const pad = el.localName === 'cxnSp' ? Math.max(lineW, 9525) * 3 : lineW / 2;
+
+            const problems = [];
+            const effects = kid(spPr, 'effectLst');
+            if (effects && [...effects.children].some(c => /Shdw$|^glow$|^softEdge$|^reflection$/.test(c.localName))) {
+                problems.push('its shadow or glow is cut off at the edge of the shape');
+            }
+
+            // --- Geometry ---
+            const geom = kid(spPr, 'prstGeom');
+            const prst = el.localName === 'graphicFrame' ? 'rect'
+                : geom ? geom.getAttribute('prst') : (kid(spPr, 'custGeom') ? 'custom' : 'rect');
+            const adjOf = (nm, def) => {
+                const gd = [...(find(geom, 'avLst') || { children: [] }).children].find(g => g.getAttribute('name') === nm);
+                const m = gd && /val\s+(-?\d+)/.exec(gd.getAttribute('fmla') || '');
+                return (m ? Number(m[1]) : def) / 100000;
+            };
+
+            let shape = null;
+            let x = box.x - pad, y = box.y - pad, w = box.w + 2 * pad, h = box.h + 2 * pad;
+            let clip = null;
+            let exactShape = true;
+
+            if (box.rot !== 0) {
+                // A rotated shape: use the upright rectangle that contains it.
+                const rad = box.rot * Math.PI / 180;
+                const cx = box.x + box.w / 2, cy = box.y + box.h / 2;
+                const rw = Math.abs(w * Math.cos(rad)) + Math.abs(h * Math.sin(rad));
+                const rh = Math.abs(w * Math.sin(rad)) + Math.abs(h * Math.cos(rad));
+                x = cx - rw / 2; y = cy - rh / 2; w = rw; h = rh;
+                exactShape = false;
+                shape = 'rotated';
+            } else if (el.localName === 'cxnSp') {
+                exactShape = false;
+                shape = 'line';
+            } else if (SHAPES[prst]) {
+                const g = SHAPES[prst](adjOf, Math.min(box.w, box.h), box.w, box.h);
+                if (g.radii) {
+                    let r = g.radii;
+                    if (box.flipH) r = [r[1], r[0], r[3], r[2]];
+                    if (box.flipV) r = [r[3], r[2], r[1], r[0]];
+                    // Outer edge of the outline is rounded by radius + pad.
+                    const outer = r.map(v => v > 0 ? v + pad : 0);
+                    if (outer.some(v => v > 0)) {
+                        clip = `inset(0 round ${outer.map(v => fmt(v / w * 100) + '%').join(' ')} / ${outer.map(v => fmt(v / h * 100) + '%').join(' ')})`;
+                    }
+                } else if (g.ellipse) {
+                    clip = 'ellipse(50% 50% at 50% 50%)';
+                } else if (g.poly) {
+                    const pts = g.poly.map(([fx, fy]) => {
+                        if (box.flipH) fx = 1 - fx;
+                        if (box.flipV) fy = 1 - fy;
+                        return `${fmt((pad + fx * box.w) / w * 100)}% ${fmt((pad + fy * box.h) / h * 100)}%`;
+                    });
+                    clip = `polygon(${pts.join(', ')})`;
+                }
+            } else {
+                exactShape = false;
+                shape = prst === 'custom' ? 'freeform' : prst;
+            }
+
+            // --- Plain-language explanation for the import report ---
+            const why = [];
+            if (fill === 'none') why.push('it has no fill, so the clip will look paused across its whole box, not just behind the text');
+            if (fill === 'seeThrough') why.push('its fill is see-through, so the clip will look paused inside it');
+            if (fill === 'line') why.push('it is a line or arrow, so the clip will look paused in the whole rectangle around it');
+            if (fill === 'unknown') why.push("it is a table, chart or SmartArt, which may be see-through in places");
+            if (shape === 'rotated') why.push('it is rotated, so it is redrawn as an upright rectangle around it, and that rectangle\'s corners will look paused');
+            else if (!exactShape && fill !== 'line') why.push(`its shape (${shape}) can't be traced, so it is redrawn as the rectangle around its main body: the corners will look paused, and anything sticking out (like a callout's tail) is cut off`);
+
+            const exact = fill === 'solid' && exactShape;
+            const entry = { x: x / slideW, y: y / slideH, w: w / slideW, h: h / slideH, redraw: true, name: label };
+            if (clip) entry.clip = clip;
+            return { entry, exact, label, why, problems };
+        }
+
+        async function readPptxMedia(file, pdfPageCount) {
+            if (!window.JSZip) await loadScript(JSZIP_URL);
+            const zip = await JSZip.loadAsync(file);
+            const parse = async path => new DOMParser().parseFromString(await zip.file(path).async('string'), 'application/xml');
+
+            const notes = [];
+            const entries = [];
+            const covers = [];            // shapes above clips that could be redrawn
+            const files = new Map();      // "media/p05-1.mp4" -> Blob
+            const usedNames = new Map();  // zip path -> media name (a clip used twice is stored once)
+
+            // Slide size and order
+            const presPath = 'ppt/presentation.xml';
+            const pres = await parse(presPath);
+            const sldSz = find(pres.documentElement, 'sldSz');
+            const slideW = Number(sldSz.getAttribute('cx'));
+            const slideH = Number(sldSz.getAttribute('cy'));
+            const presRels = await readRels(zip, presPath);
+            const slidePaths = [...find(pres.documentElement, 'sldIdLst').children]
+                .map(s => presRels.get(s.getAttributeNS(NS_R, 'id')).target);
+
+            let page = 0;
+            for (const [slideNo, slidePath] of slidePaths.entries()) {
+                const doc = await parse(slidePath);
+                // Hidden slides are left out of PDF exports, so they don't get a page.
+                if (doc.documentElement.getAttribute('show') === '0') {
+                    notes.push({ warn: false, text: `Slide ${slideNo + 1} is hidden, so it was skipped (it isn't in the PDF either).` });
+                    continue;
+                }
+                page++;
+                const rels = await readRels(zip, slidePath);
+
+                // Walk the shape tree in drawing order (later = drawn on top),
+                // keeping track of group transforms.
+                const shapes = [];
+                const identity = { sx: 1, sy: 1, tx: 0, ty: 0 };
+                const apply = (t, x, y) => ({ x: x * t.sx + t.tx, y: y * t.sy + t.ty });
+
+                const boxOf = (xfrm, t) => {
+                    const off = kid(xfrm, 'off'), ext = kid(xfrm, 'ext');
+                    if (!off || !ext) return null;
+                    const p = apply(t, Number(off.getAttribute('x')), Number(off.getAttribute('y')));
+                    return {
+                        x: p.x, y: p.y,
+                        w: Number(ext.getAttribute('cx')) * t.sx,
+                        h: Number(ext.getAttribute('cy')) * t.sy,
+                        rot: (Number(xfrm.getAttribute('rot') || 0) / 60000) % 360,   // degrees
+                        flipH: xfrm.getAttribute('flipH') === '1',
+                        flipV: xfrm.getAttribute('flipV') === '1',
+                        get rotated() { return this.rot !== 0 || this.flipH || this.flipV; }
+                    };
+                };
+
+                const walk = (parent, t) => {
+                    for (const el of parent.children) {
+                        switch (el.localName) {
+                            case 'AlternateContent': {
+                                // Newer PowerPoint features come with a fallback copy; use only one.
+                                const branch = kid(el, 'Choice') || kid(el, 'Fallback');
+                                if (branch) walk(branch, t);
+                                break;
+                            }
+                            case 'grpSp': {
+                                const xfrm = find(kid(el, 'grpSpPr'), 'xfrm');
+                                const off = kid(xfrm, 'off'), ext = kid(xfrm, 'ext');
+                                const chOff = kid(xfrm, 'chOff'), chExt = kid(xfrm, 'chExt');
+                                if (!off || !ext || !chOff || !chExt) { walk(el, t); break; }
+                                const n = (e, a) => Number(e.getAttribute(a));
+                                const sx = n(chExt, 'cx') ? n(ext, 'cx') / n(chExt, 'cx') : 1;
+                                const sy = n(chExt, 'cy') ? n(ext, 'cy') / n(chExt, 'cy') : 1;
+                                // child -> group space, then group space -> parent (t)
+                                const inner = { sx, sy, tx: n(off, 'x') - n(chOff, 'x') * sx, ty: n(off, 'y') - n(chOff, 'y') * sy };
+                                walk(el, { sx: inner.sx * t.sx, sy: inner.sy * t.sy, tx: inner.tx * t.sx + t.tx, ty: inner.ty * t.sy + t.ty });
+                                break;
+                            }
+                            case 'sp':
+                            case 'pic':
+                            case 'cxnSp':           // lines and arrows
+                            case 'graphicFrame': {  // tables, charts, SmartArt
+                                const xfrm = el.localName === 'graphicFrame' ? kid(el, 'xfrm') : find(kid(el, 'spPr'), 'xfrm');
+                                shapes.push({ el, box: xfrm ? boxOf(xfrm, t) : null });
+                                break;
+                            }
+                        }
+                    }
+                };
+                walk(find(doc.documentElement, 'spTree'), identity);
+
+                let n = 0;
+                const clipHits = [];   // shape index + box of every clip placed on this slide
+                for (const [i, { el, box }] of shapes.entries()) {
+                    if (el.localName !== 'pic') continue;
+                    const nvPr = find(kid(el, 'nvPicPr'), 'nvPr');
+                    const videoRef = find(nvPr, 'videoFile');
+                    const mediaRef = find(nvPr, 'media');   // p14:media, the embedded copy
+                    const blip = find(kid(el, 'blipFill'), 'blip');
+                    const label = `Page ${page}`;
+
+                    let rel = null, kind = null;
+                    if (videoRef || mediaRef) {
+                        kind = 'video';
+                        rel = (mediaRef && rels.get(mediaRef.getAttributeNS(NS_R, 'embed'))) ||
+                              (videoRef && rels.get(videoRef.getAttributeNS(NS_R, 'link')));
+                        if (!rel || rel.external) {
+                            notes.push({ warn: true, text: `${label}: a video is linked from outside the file (e.g. YouTube or a file on disk), so it can't be extracted.` });
+                            continue;
+                        }
+                    } else if (find(nvPr, 'audioFile')) {
+                        continue;
+                    } else if (blip) {
+                        rel = rels.get(blip.getAttributeNS(NS_R, 'embed'));
+                        if (!rel || rel.external || !/\.gif$/i.test(rel.target)) continue;
+                        const bytes = await zip.file(rel.target).async('uint8array');
+                        if (!isAnimatedGif(bytes)) continue;
+                        kind = 'gif';
+                    } else {
+                        continue;
+                    }
+
+                    if (!box) {
+                        notes.push({ warn: true, text: `${label}: a ${kind} sits in a layout placeholder without its own position. Place it by hand.` });
+                        continue;
+                    }
+                    if (!zip.file(rel.target)) {
+                        notes.push({ warn: true, text: `${label}: the ${kind} file is missing from the .pptx.` });
+                        continue;
+                    }
+
+                    n++;
+                    const ext = rel.target.split('.').pop().toLowerCase();
+                    let name = usedNames.get(rel.target);
+                    if (!name) {
+                        name = `media/p${String(page).padStart(2, '0')}-${n}.${ext}`;
+                        usedNames.set(rel.target, name);
+                        const blob = await zip.file(rel.target).async('blob');
+                        files.set(name, new Blob([blob], { type: MIME[ext] || 'application/octet-stream' }));
+                    }
+
+                    entries.push({ page, x: box.x / slideW, y: box.y / slideH, w: box.w / slideW, h: box.h / slideH, src: name });
+
+                    if (kind === 'video' && !WEB_VIDEO.test(ext)) {
+                        notes.push({ warn: true, text: `${label}: ${name} is .${ext}, which many browsers can't play. Convert it to .mp4 (H.264) and update the path.` });
+                    }
+                    if (box.rotated) {
+                        notes.push({ warn: true, text: `${label}: ${name} is rotated or flipped on the slide; the overlay is not.` });
+                    }
+                    const srcRect = find(kid(el, 'blipFill'), 'srcRect');
+                    if ((srcRect && srcRect.attributes.length) || find(el, 'trim')) {
+                        notes.push({ warn: true, text: `${label}: ${name} is cropped or trimmed in PowerPoint; the overlay shows the whole clip.` });
+                    }
+                    clipHits.push({ i, box, name });
+                }
+
+                // Shapes drawn after (= on top of) a clip would be hidden behind it
+                // online. Offer to redraw each of them from the PDF page.
+                const clipIndexes = new Set(clipHits.map(h => h.i));
+                const overlaps = (a, b) => a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+                for (const [j, { el, box }] of shapes.entries()) {
+                    if (!box || clipIndexes.has(j)) continue;
+                    const under = clipHits.filter(h => h.i < j && overlaps(box, h.box)).map(h => h.name);
+                    if (!under.length) continue;
+                    const cover = describeCover(el, box, slideW, slideH);
+                    cover.entry.page = page;
+                    cover.page = page;
+                    cover.clips = under;
+                    covers.push(cover);
+                }
+            }
+
+            if (pdfPageCount && page !== pdfPageCount) {
+                notes.unshift({ warn: true, text: `The .pptx has ${page} visible slides but the PDF has ${pdfPageCount} pages. Is the PDF exported from this exact file?` });
+            }
+            return { entries, files, notes, covers };
+        }
+
+        // ---------- Placement editor (?edit) ----------
+
+        function startEditor(images, mediaList, aspect) {
+            document.getElementById('viewer').style.display = 'none';
+            document.getElementById('viewer-controls').style.display = 'none';
+            document.body.style.justifyContent = 'flex-start';
+
+            const editorEl = document.getElementById('editor');
+            const stage = document.getElementById('ed-stage');
+            const listEl = document.getElementById('ed-list');
+            const jsonEl = document.getElementById('ed-json');
+            const pageLabel = document.getElementById('ed-page-label');
+
+            editorEl.classList.add('active');
+
+            const entries = mediaList.map(m => ({ ...m }));
+            const localPreviews = new Map(); // entry -> object URL of a locally picked file
+            let pageIndex = 0;
+            let selected = null;
+
+            const round = v => Math.round(v * 10000) / 10000;
+            const clamp01 = v => Math.min(1, Math.max(0, v));
+
+            function toFraction(e) {
+                const r = stage.getBoundingClientRect();
+                return {
+                    x: clamp01((e.clientX - r.left) / r.width),
+                    y: clamp01((e.clientY - r.top) / r.height)
+                };
+            }
+
+            // Entries on the current page; clips first, redrawn areas after (= on top).
+            const onPageOf = () => entries
+                .filter(m => m.page === pageIndex + 1)
+                .sort((a, b) => (a.redraw ? 1 : 0) - (b.redraw ? 1 : 0));
+
+            // The clip-path for a redrawn area. Hand-made ones store a simple shape
+            // name; imported ones keep the exact outline from PowerPoint.
+            function clipFor(m) {
+                switch (m.shape) {
+                    case 'rect': return null;
+                    case 'ellipse': return 'ellipse(50% 50% at 50% 50%)';
+                    case 'round': {
+                        // Corner radius: 15% of the shorter side, kept circular on screen.
+                        const wU = m.w * aspect, hU = m.h;
+                        const r = 0.15 * Math.min(wU, hU);
+                        return `inset(0 round ${fmt(r / wU * 100)}% / ${fmt(r / hU * 100)}%)`;
+                    }
+                    default: return m.clip || null;
+                }
+            }
+
+            function exportJson() {
+                const out = entries
+                    .slice()
+                    .sort((a, b) => a.page - b.page || (a.redraw ? 1 : 0) - (b.redraw ? 1 : 0) || a.y - b.y || a.x - b.x)
+                    .map(m => {
+                        const o = { page: m.page, x: round(m.x), y: round(m.y), w: round(m.w), h: round(m.h) };
+                        if (m.redraw) {
+                            o.redraw = true;
+                            const clip = clipFor(m);
+                            if (clip) o.clip = clip;
+                            if (m.name) o.name = m.name;
+                        } else {
+                            o.src = m.src || '';
+                            if (m.fit === 'contain') o.fit = 'contain';
+                        }
+                        return o;
+                    });
+                jsonEl.value = JSON.stringify(out, null, 2);
+            }
+
+            function select(entry) {
+                selected = entry;
+                render();
+            }
+
+            function render() {
+                pageLabel.textContent = `Page ${pageIndex + 1} / ${images.length}`;
+
+                // Stage: page image plus a box per entry
+                stage.innerHTML = '';
+                stage.appendChild(makePageImg(images[pageIndex]));
+                const onPage = onPageOf();
+
+                for (const m of onPage) {
+                    const box = document.createElement('div');
+                    box.className = 'region' + (m.redraw ? ' redraw' : '') + (m === selected ? ' selected' : '');
+                    box.style.left = (m.x * 100) + '%';
+                    box.style.top = (m.y * 100) + '%';
+                    box.style.width = (m.w * 100) + '%';
+                    box.style.height = (m.h * 100) + '%';
+
+                    if (m.redraw) {
+                        // Show the redrawn piece of page, tinted, in its actual shape.
+                        const cover = makeCoverEl({ ...m, clip: clipFor(m) }, images[pageIndex]);
+                        Object.assign(cover.style, { left: '0', top: '0', width: '100%', height: '100%' });
+                        const tint = document.createElement('div');
+                        tint.className = 'cover-tint';
+                        cover.appendChild(tint);
+                        box.appendChild(cover);
+                    } else {
+                        const previewSrc = localPreviews.get(m) || m.src;
+                        if (previewSrc) box.appendChild(makeMediaEl({ ...m, x: 0, y: 0, w: 1, h: 1 }, { src: previewSrc }));
+                    }
+
+                    const label = document.createElement('div');
+                    label.className = 'region-label';
+                    label.textContent = m.redraw ? 'redraw: ' + (m.name || 'page area') : (m.src || '(no media yet)');
+                    box.appendChild(label);
+
+                    const handle = document.createElement('div');
+                    handle.className = 'region-handle';
+                    box.appendChild(handle);
+
+                    box.addEventListener('pointerdown', e => {
+                        e.stopPropagation();
+                        if (selected !== m) select(m);
+                        startDrag(e, m, e.target.classList.contains('region-handle') ? 'resize' : 'move');
+                    });
+                    stage.appendChild(box);
+                }
+
+                // Side list with editable fields
+                listEl.innerHTML = '';
+                if (!onPage.length) {
+                    listEl.innerHTML = '<div class="ed-hint">None yet. Drag on the page to add one.</div>';
+                } else if (onPage.some(m => m.redraw)) {
+                    listEl.innerHTML = '<div class="ed-hint" style="margin-bottom:8px">Purple areas are copied from the page back on top of the clips, so labels stay visible. Video under them looks paused.</div>';
+                }
+                onPage.forEach((m, n) => {
+                    const item = document.createElement('div');
+                    item.className = 'ed-item' + (m === selected ? ' selected' : '');
+
+                    const typeRow = document.createElement('div');
+                    typeRow.innerHTML = `
+                        <label>Type</label>
+                        <select class="f-type">
+                            <option value="media">Video / GIF</option>
+                            <option value="redraw">Redraw page area (keeps a label above clips)</option>
+                        </select>`;
+                    const typeIn = typeRow.querySelector('.f-type');
+                    typeIn.value = m.redraw ? 'redraw' : 'media';
+                    typeIn.addEventListener('change', () => {
+                        m.redraw = typeIn.value === 'redraw';
+                        if (m.redraw && !m.clip && !m.shape) m.shape = 'rect';
+                        render();
+                    });
+
+                    if (m.redraw) {
+                        if (m.origClip === undefined) m.origClip = m.clip || null;
+                        item.innerHTML = `
+                            <strong>Redrawn area</strong><span class="f-name"></span>
+                            <label>Shape</label>
+                            <select class="f-shape">
+                                ${m.origClip ? '<option value="">As in PowerPoint</option>' : ''}
+                                <option value="rect">Rectangle</option>
+                                <option value="round">Rounded rectangle</option>
+                                <option value="ellipse">Ellipse</option>
+                            </select>
+                            <div class="ed-row"><button class="f-del ed-danger">Delete</button></div>`;
+                        item.querySelector('.f-name').textContent = m.name ? ' ' + m.name : '';
+                        item.insertBefore(typeRow, item.children[2]);
+                        typeRow.querySelector('.f-type').title = 'The page is copied back on top of the clips in this area, so a label stays visible. Anything else in the area looks paused.';
+                        const shapeIn = item.querySelector('.f-shape');
+                        shapeIn.value = m.shape || (m.origClip ? '' : 'rect');
+                        shapeIn.addEventListener('change', () => {
+                            m.shape = shapeIn.value || undefined;
+                            if (!m.shape) m.clip = m.origClip;
+                            render();
+                        });
+                        item.addEventListener('pointerdown', () => { if (selected !== m) { selected = m; highlight(); } });
+                        item.querySelector('.f-del').addEventListener('click', () => removeEntry(m));
+                        listEl.appendChild(item);
+                        return;
+                    }
+
+                    item.innerHTML = `
+                        <strong>Media ${n + 1}</strong>
+                        <label>File path (relative to index.html)</label>
+                        <input type="text" class="f-src" placeholder="${MEDIA_FOLDER}clip.mp4">
+                        <label>Fit</label>
+                        <select class="f-fit">
+                            <option value="cover">cover (fill box)</option>
+                            <option value="contain">contain (whole clip visible)</option>
+                        </select>
+                        <div class="ed-row">
+                            <button class="f-pick">Pick file…</button>
+                            <button class="f-del ed-danger">Delete</button>
+                        </div>
+                        <input type="file" class="f-file" accept="video/*,image/gif,image/webp,image/png" hidden>`;
+                    item.insertBefore(typeRow, item.children[1]);
+                    const srcIn = item.querySelector('.f-src');
+                    const fitIn = item.querySelector('.f-fit');
+                    const fileIn = item.querySelector('.f-file');
+                    srcIn.value = m.src || '';
+                    fitIn.value = m.fit === 'contain' ? 'contain' : 'cover';
+
+                    item.addEventListener('pointerdown', () => { if (selected !== m) { selected = m; highlight(); } });
+                    srcIn.addEventListener('change', () => {
+                        m.src = srcIn.value.trim();
+                        localPreviews.delete(m);
+                        exportJson();
+                        render();
+                    });
+                    fitIn.addEventListener('change', () => { m.fit = fitIn.value; exportJson(); render(); });
+                    item.querySelector('.f-pick').addEventListener('click', () => fileIn.click());
+                    fileIn.addEventListener('change', () => {
+                        const file = fileIn.files[0];
+                        if (!file) return;
+                        // A web page can't see your folders, so we assume the file
+                        // will live in media/ and preview it from your disk for now.
+                        m.src = MEDIA_FOLDER + file.name;
+                        localPreviews.set(m, URL.createObjectURL(file));
+                        exportJson();
+                        render();
+                    });
+                    item.querySelector('.f-del').addEventListener('click', () => removeEntry(m));
+                    listEl.appendChild(item);
+                });
+
+                exportJson();
+            }
+
+            // Update selection styling without rebuilding (keeps input focus).
+            function highlight() {
+                const onPage = onPageOf();
+                stage.querySelectorAll('.region').forEach((b, i) => b.classList.toggle('selected', onPage[i] === selected));
+                listEl.querySelectorAll('.ed-item').forEach((it, i) => it.classList.toggle('selected', onPage[i] === selected));
+            }
+
+            function removeEntry(m) {
+                entries.splice(entries.indexOf(m), 1);
+                localPreviews.delete(m);
+                if (selected === m) selected = null;
+                render();
+            }
+
+            // Move / resize an existing box
+            function startDrag(e, m, mode) {
+                const start = toFraction(e);
+                const orig = { x: m.x, y: m.y, w: m.w, h: m.h };
+                const box = stage.querySelectorAll('.region')[onPageOf().indexOf(m)];
+                stage.setPointerCapture(e.pointerId);
+
+                const onMove = ev => {
+                    const p = toFraction(ev);
+                    const dx = p.x - start.x, dy = p.y - start.y;
+                    if (mode === 'move') {
+                        m.x = Math.min(1 - orig.w, Math.max(0, orig.x + dx));
+                        m.y = Math.min(1 - orig.h, Math.max(0, orig.y + dy));
+                    } else {
+                        m.w = Math.max(0.01, Math.min(1 - orig.x, orig.w + dx));
+                        m.h = Math.max(0.01, Math.min(1 - orig.y, orig.h + dy));
+                    }
+                    box.style.left = (m.x * 100) + '%';
+                    box.style.top = (m.y * 100) + '%';
+                    box.style.width = (m.w * 100) + '%';
+                    box.style.height = (m.h * 100) + '%';
+                };
+                const onUp = () => {
+                    stage.removeEventListener('pointermove', onMove);
+                    stage.removeEventListener('pointerup', onUp);
+                    exportJson();
+                };
+                stage.addEventListener('pointermove', onMove);
+                stage.addEventListener('pointerup', onUp);
+            }
+
+            // Draw a new box on empty page area
+            stage.addEventListener('pointerdown', e => {
+                if (e.button !== 0) return;
+                const start = toFraction(e);
+                const ghost = document.createElement('div');
+                ghost.className = 'region selected';
+                stage.appendChild(ghost);
+                stage.setPointerCapture(e.pointerId);
+                let rect = { x: start.x, y: start.y, w: 0, h: 0 };
+
+                const onMove = ev => {
+                    const p = toFraction(ev);
+                    rect = {
+                        x: Math.min(start.x, p.x), y: Math.min(start.y, p.y),
+                        w: Math.abs(p.x - start.x), h: Math.abs(p.y - start.y)
+                    };
+                    ghost.style.left = (rect.x * 100) + '%';
+                    ghost.style.top = (rect.y * 100) + '%';
+                    ghost.style.width = (rect.w * 100) + '%';
+                    ghost.style.height = (rect.h * 100) + '%';
+                };
+                const onUp = () => {
+                    stage.removeEventListener('pointermove', onMove);
+                    stage.removeEventListener('pointerup', onUp);
+                    ghost.remove();
+                    if (rect.w < 0.01 || rect.h < 0.01) {   // a plain click: deselect
+                        select(null);
+                        return;
+                    }
+                    const entry = { page: pageIndex + 1, ...rect, src: '' };
+                    entries.push(entry);
+                    select(entry);
+                    const inputs = listEl.querySelectorAll('.f-src');
+                    if (inputs.length) inputs[inputs.length - 1].focus();
+                };
+                stage.addEventListener('pointermove', onMove);
+                stage.addEventListener('pointerup', onUp);
+            });
+
+            // PowerPoint import
+            const importBtn = document.getElementById('ed-import');
+            const importFile = document.getElementById('ed-import-file');
+            const zipBtn = document.getElementById('ed-zip');
+            const reportEl = document.getElementById('ed-report');
+            let importedFiles = null;
+
+            importBtn.addEventListener('click', () => importFile.click());
+            importFile.addEventListener('change', async () => {
+                const file = importFile.files[0];
+                importFile.value = '';
+                if (!file) return;
+                if (entries.length && !confirm('Replace the media boxes you already have with the ones from the PowerPoint file?')) return;
+
+                reportEl.textContent = 'Reading ' + file.name + '…';
+                try {
+                    const result = await readPptxMedia(file, images.length);
+                    for (const url of localPreviews.values()) URL.revokeObjectURL(url);
+                    localPreviews.clear();
+                    entries.length = 0;
+                    for (const m of result.entries) {
+                        entries.push(m);
+                        localPreviews.set(m, URL.createObjectURL(result.files.get(m.src)));
+                    }
+                    importedFiles = result.files;
+                    zipBtn.hidden = !result.files.size;
+
+                    const pages = [...new Set(result.entries.map(m => m.page))];
+                    reportEl.innerHTML = '';
+                    const summary = document.createElement('div');
+                    summary.className = 'ok';
+                    summary.textContent = result.entries.length
+                        ? `Placed ${result.entries.length} clip(s) on page(s) ${pages.join(', ')}. Download the media files and unzip them next to index.html.`
+                        : 'No embedded videos or animated GIFs found.';
+                    reportEl.appendChild(summary);
+                    if (result.notes.length) {
+                        const ul = document.createElement('ul');
+                        for (const note of result.notes) {
+                            const li = document.createElement('li');
+                            li.className = note.warn ? 'warn' : '';
+                            li.textContent = note.text;
+                            ul.appendChild(li);
+                        }
+                        reportEl.appendChild(ul);
+                    }
+
+                    // Shapes that sit above a clip: offer to redraw each one.
+                    // Exact cut-outs start ticked; approximations start unticked
+                    // and say what will look wrong.
+                    if (result.covers.length) {
+                        const box = document.createElement('div');
+                        box.className = 'cover-opts';
+                        box.innerHTML = `
+                            <strong>Shapes on top of clips</strong>
+                            <div class="ed-hint">Online, clips are drawn above the page, so these would be hidden.
+                            Ticking one copies it from the PDF back on top of the clip. Only the part of the
+                            clip inside the redrawn area looks paused, which is invisible when the shape is solid.</div>`;
+                        for (const c of result.covers) {
+                            if (c.exact) entries.push(c.entry);
+                            const row = document.createElement('label');
+                            row.className = 'cover-opt';
+                            const cb = document.createElement('input');
+                            cb.type = 'checkbox';
+                            cb.checked = c.exact;
+                            const txt = document.createElement('span');
+                            const status = c.exact
+                                ? 'exact match, nothing will look paused'
+                                : 'approximate: ' + c.why.join('; ');
+                            const extra = c.problems.length ? ' Note: ' + c.problems.join('; ') + '.' : '';
+                            txt.innerHTML = `<b></b> <span class="cover-where"></span><br><span class="${c.exact ? 'ok' : 'warn'}"></span>`;
+                            txt.querySelector('b').textContent = c.label;
+                            txt.querySelector('.cover-where').textContent = `(page ${c.page}, over ${c.clips.join(', ')})`;
+                            txt.querySelector(c.exact ? '.ok' : '.warn').textContent = status.charAt(0).toUpperCase() + status.slice(1) + '.' + extra;
+                            cb.addEventListener('change', () => {
+                                const at = entries.indexOf(c.entry);
+                                if (cb.checked && at < 0) entries.push(c.entry);
+                                if (!cb.checked && at >= 0) entries.splice(at, 1);
+                                if (selected === c.entry) selected = null;
+                                if (cb.checked) pageIndex = c.page - 1;
+                                render();
+                            });
+                            row.append(cb, txt);
+                            box.appendChild(row);
+                        }
+                        reportEl.appendChild(box);
+                    }
+
+                    selected = null;
+                    if (pages.length) pageIndex = Math.min(pages[0], images.length) - 1;
+                    render();
+                } catch (err) {
+                    console.error(err);
+                    reportEl.innerHTML = '';
+                    const div = document.createElement('div');
+                    div.className = 'warn';
+                    div.textContent = "Couldn't read that file as a PowerPoint presentation (" + err.message + ').';
+                    reportEl.appendChild(div);
+                }
+            });
+
+            zipBtn.addEventListener('click', async () => {
+                if (!importedFiles) return;
+                const zip = new JSZip();
+                for (const [name, blob] of importedFiles) zip.file(name, blob);
+                const a = document.createElement('a');
+                a.href = URL.createObjectURL(await zip.generateAsync({ type: 'blob' }));
+                a.download = 'media.zip';
+                a.click();
+            });
+
+            document.addEventListener('keydown', e => {
+                const typing = /INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName);
+                if (typing) return;
+                if ((e.key === 'Delete' || e.key === 'Backspace') && selected) {
+                    e.preventDefault();
+                    removeEntry(selected);
+                } else if (e.key === 'ArrowLeft') {
+                    goTo(pageIndex - 1);
+                } else if (e.key === 'ArrowRight') {
+                    goTo(pageIndex + 1);
+                }
+            });
+
+            function goTo(i) {
+                if (i < 0 || i >= images.length) return;
+                pageIndex = i;
+                selected = null;
+                render();
+            }
+
+            document.getElementById('ed-prev').addEventListener('click', () => goTo(pageIndex - 1));
+            document.getElementById('ed-next').addEventListener('click', () => goTo(pageIndex + 1));
+
+            document.getElementById('ed-download').addEventListener('click', () => {
+                exportJson();
+                const a = document.createElement('a');
+                a.href = URL.createObjectURL(new Blob([jsonEl.value + '\n'], { type: 'application/json' }));
+                a.download = 'media.json';
+                a.click();
+            });
+
+            document.getElementById('ed-copy').addEventListener('click', async (e) => {
+                exportJson();
+                try {
+                    await navigator.clipboard.writeText(jsonEl.value);
+                    e.target.textContent = 'Copied';
+                } catch {
+                    jsonEl.select();
+                    e.target.textContent = 'Press Ctrl+C';
+                }
+                setTimeout(() => { e.target.textContent = 'Copy'; }, 1500);
+            });
+
+            render();
+        }
+
+        // ---------- Start ----------
+
+        document.addEventListener('DOMContentLoaded', async () => {
+            const statusEl = document.getElementById('status');
+            try {
+                const [{ images, aspect }, mediaList] = await Promise.all([renderPdf(statusEl), loadMediaList()]);
+                statusEl.style.display = 'none';
+                if (EDIT_MODE) startEditor(images, mediaList, aspect);
+                else startViewer(images, aspect, mediaList);
+            } catch (err) {
+                console.error(err);
+                statusEl.textContent = 'Error: Make sure your file is named "document.pdf" in the main folder.';
+            }
+        });
+    </script>
+</body>
+</html>
